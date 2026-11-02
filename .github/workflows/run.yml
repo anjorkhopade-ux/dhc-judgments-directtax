@@ -1,6 +1,15 @@
 name: Fetch Delhi HC judgments
 
 on:
+  schedule:
+    # Times are in UTC (IST minus 5:30)
+    - cron: "30 4 * * *"    # 10:00 AM IST
+    - cron: "30 8 * * *"    # 2:00 PM IST
+    - cron: "0 11 * * *"    # 4:30 PM IST
+    - cron: "0 12 * * *"    # 5:30 PM IST
+    - cron: "0 13 * * *"    # 6:30 PM IST
+    - cron: "0 14 * * *"    # 7:30 PM IST
+    - cron: "0 15 * * *"    # 8:30 PM IST
   workflow_dispatch:
     inputs:
       test_limit:
@@ -43,6 +52,7 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@users.noreply.github.com"
+          git pull --rebase || true
           git add downloaded.json
           git diff --cached --quiet || git commit -m "Update downloaded judgments list"
           git push
