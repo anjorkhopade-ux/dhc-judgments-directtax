@@ -1,0 +1,59 @@
+name: Fetch Delhi HC judgments
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_limit:
+        description: "Max new judgments per judge (0 = no limit)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: judgments
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: pip install requests pypdf
+
+      - name: Fetch judgments
+        env:
+          DRIVE_URL: ${{ secrets.DRIVE_URL }}
+          DRIVE_SECRET: ${{ secrets.DRIVE_SECRET }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          DAYS_BACK: "40"
+          TEST_LIMIT: ${{ github.event.inputs.test_limit || '0' }}
+        run: python scraper.py
+
+      - name: Save the list of downloaded judgments
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add downloaded.json
+          git diff --cached --quiet || git commit -m "Update downloaded judgments list"
+          git push
+
+      - name: Tell Make to send the email
+        if: always()
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+        run: |
+          if [ -n "$MAKE_WEBHOOK_URL" ]; then
+            curl -s -X POST "$MAKE_WEBHOOK_URL" -H "Content-Type: application/json" -d '{"source":"judgments"}'
+          else
+            echo "No MAKE_WEBHOOK_URL yet - skipping email"
+          fi
