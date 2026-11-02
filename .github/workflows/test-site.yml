@@ -1,0 +1,13 @@
+name: Test site access
+on:
+  workflow_dispatch:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Try to open Delhi HC website
+        run: |
+          curl -sS -L -A "Mozilla/5.0" -o page.html -w "Status code: %{http_code}\n" --max-time 60 https://delhihighcourt.nic.in/app/sitting-judge-wise
+          echo "Page size in bytes:"
+          wc -c page.html
+          head -c 1500 page.html
