@@ -1,5 +1,5 @@
-"""Delhi High Court - fetch orders judge-wise, save new ones to Google Drive,
-and log case details (with party names read by OpenAI) to Google Sheets."""
+"""Delhi High Court - fetch JUDGMENTS judge-wise, save new ones to Google Drive,
+and log case details to Google Sheets (via the Apps Script receiver)."""
 import base64
 import datetime as dt
 import hashlib
@@ -15,12 +15,12 @@ import requests
 from pypdf import PdfReader
 
 BASE = "https://delhihighcourt.nic.in/app/"
-PAGE = BASE + "sitting-judge-wise"
-DAYS_BACK = int(os.environ.get("DAYS_BACK", "20"))
+PAGE = BASE + "sitting-judges-wise-data"
+DAYS_BACK = int(os.environ.get("DAYS_BACK", "40"))
 TEST_LIMIT = int(os.environ.get("TEST_LIMIT") or "0")  # 0 means no limit
 DRIVE_URL = os.environ.get("DRIVE_URL", "")
 DRIVE_SECRET = os.environ.get("DRIVE_SECRET", "")
-OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")
+OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "")  # optional: only used if the table has no party names
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL") or "gpt-4.1-mini"
 SEEN_FILE = "downloaded.json"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -29,12 +29,11 @@ IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
 STOP_WORDS = {"justice", "hon", "ble", "honble", "the", "acting", "chief",
               "mr", "ms", "mrs", "dr"}
 PARTY_PROMPT = (
-    "You extract party names from Delhi High Court orders. The cause title lists "
+    "You extract party names from Delhi High Court judgments. The cause title lists "
     "parties as 'X ... Petitioner' versus 'Y ... Respondent'. Treat appellant, "
     "plaintiff, applicant and complainant as the petitioner side, and defendant, "
     "respondent and accused as the respondent side. Use the first-named party on "
-    "each side; if more parties are on that side, add ' & Ors.'. Give names only, "
-    "without addresses, designations of advocates, or words like 'Petitioner'. "
+    "each side; if more parties are on that side, add ' & Ors.'. Give names only. "
     "Reply as JSON: {\"petitioner\": \"...\", \"respondent\": \"...\"}. "
     "Use an empty string if a name cannot be found.")
 
@@ -49,15 +48,9 @@ def text_of(fragment):
     return re.sub(r"\s+", " ", html.unescape(t)).strip()
 
 
-def links_in(fragment):
-    return [html.unescape(h) for h in
-            re.findall(r'href=["\']([^"\']+)["\']', str(fragment or ""))
-            if not h.startswith("javascript")]
-
-
 def safe(s, n=80):
     s = re.sub(r"[^A-Za-z0-9.\-]+", "_", s).strip("_")
-    return s[:n] or "order"
+    return s[:n] or "judgment"
 
 
 def read_judges(path="judges.txt"):
@@ -69,12 +62,13 @@ def open_page(s):
     r = s.get(PAGE, timeout=60)
     r.raise_for_status()
     t = r.text
-    token = re.search(r'"_token"\s*:\s*"([^"]+)"', t)
+    token = (re.search(r'name="_token"\s+value="([^"]+)"', t)
+             or re.search(r'"_token"\s*:\s*"([^"]+)"', t))
     cap = re.search(r'id="captcha-code"[^>]*>\s*([^<\s]+)\s*<', t)
     if not token or not cap:
         raise RuntimeError("Could not find the security token or captcha on the page")
     opts = [(v, html.unescape(n).strip()) for v, n in
-            re.findall(r'<option value="([^"]+)">([^<]+)</option>', t)]
+            re.findall(r'<option value="(\d+)"[^>]*>([^<]+)</option>', t)]
     return token.group(1), cap.group(1), opts
 
 
@@ -105,61 +99,59 @@ def match_judge(name, opts):
     return None
 
 
-def dt_params(code, from_d, to_d, start, length, draw):
-    p = {"draw": draw, "start": start, "length": length,
-         "search[value]": "", "search[regex]": "false",
-         "order[0][column]": "1", "order[0][dir]": "desc",
-         "s_judge_name": code, "from_date": from_d, "to_date": to_d,
-         "hindi_order": "", "btn_view": "", "_": int(time.time() * 1000)}
-    cols = [("DT_RowIndex", "DT_RowIndex", False, False),
-            (None, "order_date.timestamp", True, True),
-            ("case_no_order_link", "case_no_order_link", True, True),
-            ("corrigendum", "corrigendum", True, False),
-            ("hindi_order", "hindi_order", False, False),
-            ("btn_view", "btn_view", False, False)]
-    for i, (data, name, srch, orde) in enumerate(cols):
-        if data is None:
-            p[f"columns[{i}][data][_]"] = "order_date.display"
-            p[f"columns[{i}][data][sort]"] = "order_date.timestamp"
-        else:
-            p[f"columns[{i}][data]"] = data
-        p[f"columns[{i}][name]"] = name
-        p[f"columns[{i}][searchable]"] = str(srch).lower()
-        p[f"columns[{i}][orderable]"] = str(orde).lower()
-        p[f"columns[{i}][search][value]"] = ""
-        p[f"columns[{i}][search][regex]"] = "false"
-    return p
+def search(s, token, cap, code, from_d, to_d):
+    """Submit the form the same way the website does; results come back as a full page."""
+    r = s.post(PAGE, data={"_token": token, "s_judge_name": code, "from_date": from_d,
+                           "to_date": to_d, "randomid": cap, "captchaInput": cap},
+               headers={"Referer": PAGE, "Origin": "https://delhihighcourt.nic.in"},
+               timeout=120)
+    r.raise_for_status()
+    if 's_judgeTable' not in r.text:
+        raise RuntimeError(f"Results table not found in the reply (HTTP {r.status_code})")
+    return r.text
 
 
-def fetch_rows(s, code, from_d, to_d):
-    rows, start, draw, size = [], 0, 1, 100
-    while True:
-        r = s.get(PAGE, params=dt_params(code, from_d, to_d, start, size, draw),
-                  headers={"X-Requested-With": "XMLHttpRequest", "Referer": PAGE,
-                           "Accept": "application/json, text/javascript, */*; q=0.01"},
-                  timeout=90)
-        try:
-            j = r.json()
-        except ValueError:
-            raise RuntimeError(f"Unexpected reply (HTTP {r.status_code}): {r.text[:300]}")
-        data = j.get("data") or []
-        rows.extend(data)
-        total = int(j.get("recordsFiltered") or j.get("recordsTotal") or 0)
-        start += size
-        draw += 1
-        if not data or start >= total:
-            return rows
+def parse_rows(page):
+    """Read the results table. Returns one item per PDF (several case numbers can share one PDF)."""
+    page = re.sub(r"<!--.*?-->", "", page, flags=re.S)  # the site leaves old rows in comments
+    m = re.search(r'id="s_judgeTable".*?</table>', page, flags=re.S)
+    if not m:
+        return []
+    items, order = {}, []
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", m.group(0), flags=re.S):
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.S)
+        if len(cells) < 6:
+            continue  # header or "No data" row
+        case_cell, date_cell, party_cell, corr_cell, upload_cell = cells[1:6]
+        case = text_of(re.split(r"<br\s*/?>", case_cell, maxsplit=1)[0])
+        citation = text_of(" ".join(re.findall(r"<a[^>]*>(.*?)</a>", case_cell, flags=re.S)))
+        pdfs = [html.unescape(h) for h in re.findall(r'href=["\']([^"\']+)["\']', date_cell)
+                if h.lower().split("?")[0].endswith(".pdf")]
+        sides = re.split(r"<b>\s*Vs\.?\s*</b>", party_cell, flags=re.I)
+        pet = text_of(sides[0])
+        resp = text_of(sides[1]) if len(sides) > 1 else ""
+        jdate = re.sub(r"\s*\(pdf\)\s*", "", text_of(re.split(r"<br\s*/?>", date_cell)[0]))
+        corr = [html.unescape(h) for h in re.findall(r'href=["\']([^"\']+)["\']', corr_cell)
+                if h.lower().split("?")[0].endswith(".pdf")]
+        base = {"citation": citation, "petitioner": pet, "respondent": resp,
+                "judgment_date": jdate, "uploaded_on": text_of(upload_cell)}
+        for kind, links in (("", pdfs), (" (Corrigendum)", corr)):
+            for link in links:
+                url = urljoin(PAGE, link)
+                if url not in items:
+                    items[url] = dict(base, url=url, cases=[])
+                    order.append(url)
+                if case and case + kind not in items[url]["cases"]:
+                    items[url]["cases"].append(case + kind)
+    out = []
+    for url in order:
+        it = items[url]
+        it["case"] = ", ".join(it.pop("cases"))
+        out.append(it)
+    return out
 
 
-def date_display(row):
-    d = row.get("order_date")
-    if isinstance(d, dict):
-        d = d.get("display")
-    return text_of(d)
-
-
-def order_date(row):
-    d = date_display(row)
+def iso_date(d):
     for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%Y-%m-%d", "%d.%m.%Y"):
         try:
             return dt.datetime.strptime(d, fmt).strftime("%Y-%m-%d")
@@ -176,30 +168,23 @@ def get_pdf(s, url):
     return r.content
 
 
-def first_pages_text(content, pages=2):
-    try:
-        reader = PdfReader(io.BytesIO(content))
-        return "\n".join((p.extract_text() or "") for p in reader.pages[:pages])[:6000]
-    except Exception:
-        return ""
-
-
-def parties(content, case):
+def parties_from_pdf(content, case):
     if not OPENAI_KEY:
         return "", ""
-    text = first_pages_text(content)
+    try:
+        reader = PdfReader(io.BytesIO(content))
+        text = "\n".join((p.extract_text() or "") for p in reader.pages[:2])[:6000]
+    except Exception:
+        text = ""
     if not text.strip():
-        print("    (no readable text in PDF - party names left blank)")
         return "", ""
     try:
         r = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_KEY}"},
-            json={"model": OPENAI_MODEL,
-                  "response_format": {"type": "json_object"},
-                  "messages": [
-                      {"role": "system", "content": PARTY_PROMPT},
-                      {"role": "user", "content": f"Case number: {case}\n\nOrder text:\n{text}"}]},
+            json={"model": OPENAI_MODEL, "response_format": {"type": "json_object"},
+                  "messages": [{"role": "system", "content": PARTY_PROMPT},
+                               {"role": "user", "content": f"Case number: {case}\n\nJudgment text:\n{text}"}]},
             timeout=90)
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
@@ -240,19 +225,17 @@ def save_seen(seen):
 def main():
     if not DRIVE_URL or not DRIVE_SECRET:
         raise SystemExit("The DRIVE_URL / DRIVE_SECRET secrets are missing in GitHub")
-    if not OPENAI_KEY:
-        print("Note: OPENAI_API_KEY is missing, so party names will be left blank")
     judges = read_judges()
     today = dt.datetime.now(IST).date()
     from_d = (today - dt.timedelta(days=DAYS_BACK)).strftime("%d-%m-%Y")
     to_d = today.strftime("%d-%m-%Y")
-    print(f"Looking for orders from {from_d} to {to_d}")
+    print(f"Looking for judgments from {from_d} to {to_d}")
 
     seen = set()
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE) as f:
             seen = set(json.load(f))
-    print(f"Already saved earlier: {len(seen)} orders")
+    print(f"Already saved earlier: {len(seen)} judgments")
 
     s = requests.Session()
     s.headers["User-Agent"] = UA
@@ -272,47 +255,50 @@ def main():
         try:
             token, cap, _ = open_page(s)
             solve_captcha(s, token, cap)
-            rows = fetch_rows(s, code, from_d, to_d)
-            print(f"  {len(rows)} orders listed")
+            items = parse_rows(search(s, token, cap, code, from_d, to_d))
+            print(f"  {len(items)} judgments listed")
             done = 0
-            for row in rows:
+            for it in items:
                 if TEST_LIMIT and done >= TEST_LIMIT:
                     break
-                case = text_of(row.get("case_no_order_link"))
-                for link in links_in(row.get("case_no_order_link")):
-                    url = urljoin(PAGE, link)
-                    if url in seen:
+                url = it["url"]
+                if url in seen:
+                    skipped += 1
+                    continue
+                tag = hashlib.md5(url.encode()).hexdigest()[:6]
+                first_case = it["case"].split(", ")[0]
+                fname = f"{iso_date(it['judgment_date'])}_{safe(first_case)}_{tag}.pdf"
+                try:
+                    content = get_pdf(s, url)
+                    pet, resp = it["petitioner"], it["respondent"]
+                    if not pet and not resp:
+                        pet, resp = parties_from_pdf(content, it["case"])
+                    res = upload(content, fname, full_name,
+                                 {"case": it["case"], "citation": it["citation"],
+                                  "petitioner": pet, "respondent": resp,
+                                  "judgment_date": it["judgment_date"],
+                                  "uploaded_on": it["uploaded_on"]})
+                    seen.add(url)
+                    streak = 0
+                    done += 1
+                    if res.get("skipped"):
                         skipped += 1
-                        continue
-                    tag = hashlib.md5(url.encode()).hexdigest()[:6]
-                    fname = f"{order_date(row)}_{safe(case)}_{tag}.pdf"
-                    try:
-                        content = get_pdf(s, url)
-                        pet, resp = parties(content, case)
-                        res = upload(content, fname, full_name,
-                                     {"case": case, "petitioner": pet, "respondent": resp,
-                                      "order_date": date_display(row)})
-                        seen.add(url)
-                        streak = 0
-                        done += 1
-                        if res.get("skipped"):
-                            skipped += 1
-                            print(f"  = already in Drive: {fname}")
-                        else:
-                            new_files += 1
-                            print(f"  + {case} | {pet or '?'} vs {resp or '?'}")
-                    except Exception as e:
-                        print(f"  ! {fname}: {e}")
-                        streak += 1
-                        if streak >= 5:
-                            save_seen(seen)
-                            raise SystemExit("Stopping: 5 failures in a row. See the messages above.")
+                        print(f"  = already in Drive: {fname}")
+                    else:
+                        new_files += 1
+                        print(f"  + {it['case']} | {pet or '?'} vs {resp or '?'}")
+                except Exception as e:
+                    print(f"  ! {fname}: {e}")
+                    streak += 1
+                    if streak >= 5:
+                        save_seen(seen)
+                        raise SystemExit("Stopping: 5 failures in a row. See the messages above.")
         except Exception as e:
             print(f"  ! Failed: {e}")
             failures += 1
         save_seen(seen)
 
-    print(f"\nDone. New orders saved to Drive: {new_files}. "
+    print(f"\nDone. New judgments saved to Drive: {new_files}. "
           f"Skipped (already saved): {skipped}. Judges with problems: {failures}")
     if failures and failures == len(judges):
         raise SystemExit(1)
