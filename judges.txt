@@ -1,4 +1,5 @@
 # Judges to track (one per line). Lines starting with # are ignored.
-ANUP JAIRAM BHAMBHANI
-VIKAS MAHAJAN
-PURUSHAINDRA KUMAR KAURAV
+Dinesh Mehta
+Aditi Choudhary
+Subramonium Prasad
+Renu Bhatnagar
